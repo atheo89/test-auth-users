@@ -1,0 +1,93 @@
+name: Sync branches through Pull Request
+
+on:  # yamllint disable-line rule:truthy
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Source branch
+        required: true
+      target:
+        description: Target branch
+        required: true
+
+jobs:
+  check-approver:
+    runs-on: ubuntu-latest
+    outputs:
+      is-approver: ${{ steps.check-approver.outputs.is-approver }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse OWNERS file and check approver
+        id: check-approver
+        run: |
+
+          mapfile -t approvers < <(awk '/approvers:/ {found=1; next} /reviewers:/ {found=0} found {gsub(/^[ \t]*-?[ \t]*/, ""); print}' OWNERS)
+
+          # Initialize a flag to track if the user is an approver
+          is_approver=false
+
+          # Check if $GITHUB_ACTOR is in the list of approvers
+          for approver in "${approvers[@]}"; do
+            if [[ "$GITHUB_ACTOR" == "$approver" ]]; then
+              echo "User $GITHUB_ACTOR is allowed to run the workflow."
+              is_approver=true
+              break  # Exit the loop since we found the approver
+            fi
+          done
+
+          # Set output based on the approver status
+          if [[ "$is_approver" == true ]]; then
+            echo "is-approver=true" >> ${GITHUB_OUTPUT}
+          else
+            echo "User $GITHUB_ACTOR is not allowed to run the workflow."
+            echo "is-approver=false" >> ${GITHUB_OUTPUT}
+          fi
+
+
+  sync:
+    needs: check-approver
+    if: needs.check-approver.outputs.is-approver == 'true'
+    permissions:
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target }}
+          fetch-depth: 0
+
+      - name: Prepare sync branch
+        id: prepare
+        run: |
+          git fetch origin ${{ github.event.inputs.source }}
+          git reset --hard origin/${{ github.event.inputs.source }}
+
+          TIMESTAMP=$(date +'%Y%m%d%H%M%S')
+          SYNC_BRANCH=sync__${{ github.event.inputs.source }}__${{ github.event.inputs.target }}__${TIMESTAMP}
+          echo "branch=$SYNC_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v7.0.5
+        with:
+          branch: ${{ steps.prepare.outputs.branch }}
+          title: "Sync `${{ github.event.inputs.target }}` branch with `${{ github.event.inputs.source }}` branch"
+          body: |
+            :robot: This is an automated Pull Request created by `/.github/workflows/sync-branches-through-pr.yml`.
+
+            It merges all commits from `${{ github.event.inputs.source }}` branch into `${{ github.event.inputs.target }}` branch.
+
+            :warning: **IMPORTANT NOTE**: Remember to delete the `${{ steps.prepare.outputs.branch }}` branch after merging the changes.
+
+  fail-unauthorized:
+    needs: check-approver
+    if: needs.check-approver.outputs.is-approver == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail job for unauthorized user
+        run: |
+          echo "You are not authorized to run this workflow. Only approvers listed in OWNERS.yaml can run it."
+          exit 1
